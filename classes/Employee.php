@@ -1,4 +1,5 @@
 <?php
+require_once __DIR__ . '/../classes/AuditLogger.php';
 
 class Employee
 {
@@ -26,6 +27,7 @@ class Employee
                 e.address,
                 e.department_id,
                 e.position_id,
+                e.`rank`,
                 e.date_hired,
                 e.employment_type,
                 e.employment_status,
@@ -95,6 +97,7 @@ class Employee
                 address,
                 department_id,
                 position_id,
+                `rank`,
                 {$mgrCol}date_hired,
                 employment_type,
                 employment_status
@@ -112,6 +115,7 @@ class Employee
                 :address,
                 :department_id,
                 :position_id,
+                :rank,
                 {$mgrVal}:date_hired,
                 :employment_type,
                 :employment_status
@@ -133,6 +137,14 @@ class Employee
             'address' => $data['address'] ?: null,
             'department_id' => $data['department_id'] ?: null,
             'position_id' => $data['position_id'] ?: null,
+            'rank' => in_array(
+                $data['rank'] ?? 'employee',
+                ['employee', 'team_leader', 'manager'],
+                true
+            )
+                ? $data['rank']
+                : 'employee',
+
             'date_hired' => $data['date_hired'],
             'employment_type' => $data['employment_type'],
             'employment_status' => $data['employment_status']
@@ -141,7 +153,20 @@ class Employee
             $params['manager_id'] = $data['manager_id'] ?: null;
         }
 
-        return $stmt->execute($params);
+        $result = $stmt->execute($params);
+
+        if ($result) {
+            $newId = (int) $this->pdo->lastInsertId();
+            AuditLogger::log('employee.create', 'employee', $newId, [
+                'employee_id'   => $employeeId,
+                'name'          => $data['first_name'] . ' ' . $data['last_name'],
+                'department_id' => $data['department_id'] ?? null,
+                'position_id'   => $data['position_id']  ?? null,
+                'rank'          => $params['rank'],
+            ]);
+        }
+
+        return $result;
     }
 
     /**
@@ -152,16 +177,29 @@ class Employee
     public function getManagerOptions(?int $keepId = null): array
     {
         $stmt = $this->pdo->prepare("
-            SELECT e.id, e.employee_id, e.first_name, e.last_name
-            FROM employees e
-            WHERE e.id = :keep
-               OR e.id IN (
-                    SELECT employee_id FROM users
-                    WHERE LOWER(role) = 'manager' AND status = 'Active' AND employee_id IS NOT NULL
-               )
-            ORDER BY e.last_name, e.first_name
-        ");
-        $stmt->execute(['keep' => $keepId]);
+        SELECT
+            e.id,
+            e.employee_id,
+            e.first_name,
+            e.last_name
+        FROM employees e
+        WHERE e.id = :keep
+           OR e.id IN (
+                SELECT u.employee_id
+                FROM users u
+                INNER JOIN employees manager_employee
+                    ON manager_employee.id = u.employee_id
+                WHERE u.status = 'Active'
+                  AND u.employee_id IS NOT NULL
+                  AND manager_employee.`rank` = 'manager'
+           )
+        ORDER BY e.last_name, e.first_name
+    ");
+
+        $stmt->execute([
+            'keep' => $keepId
+        ]);
+
         return $stmt->fetchAll(PDO::FETCH_ASSOC);
     }
 
@@ -183,7 +221,8 @@ class Employee
         return false;
     }
 
-    public function update(int $id, array $data): bool {
+    public function update(int $id, array $data): bool
+    {
 
         // manager_id ("reports to") is only written when the caller sends it,
         // so forms that don't know about it never wipe it.
@@ -204,6 +243,7 @@ class Employee
             address =           :address,
             department_id =     :department_id,
             position_id =       :position_id,
+            `rank` = :rank,
             date_hired =        :date_hired,
             employment_type =   :employment_type,
             employment_status = :employment_status,
@@ -226,6 +266,14 @@ class Employee
             'address'           => $data['address'],
             'department_id'     => $data['department_id'],
             'position_id'        => $data['position_id'],
+            'rank' => in_array(
+                $data['rank'] ?? 'employee',
+                ['employee', 'team_leader', 'manager'],
+                true
+            )
+                ? $data['rank']
+                : 'employee',
+
             'date_hired'        => $data['date_hired'],
             'employment_type'   => $data['employment_type'],
             'employment_status' => $data['employment_status'],
@@ -235,30 +283,66 @@ class Employee
             $params['manager_id'] = $data['manager_id'] ?: null;
         }
 
-        return $stmt->execute($params);
+        $old = $this->findById($id);
+
+        $result = $stmt->execute($params);
+
+        if ($result && $old) {
+            AuditLogger::log('employee.update', 'employee', $id, [
+                'old' => [
+                    'first_name'        => $old['first_name'],
+                    'last_name'         => $old['last_name'],
+                    'rank'              => $old['rank'],
+                    'department_id'     => $old['department_id'],
+                    'position_id'       => $old['position_id'],
+                    'employment_status' => $old['employment_status'],
+                ],
+                'new' => [
+                    'first_name'        => $data['first_name'],
+                    'last_name'         => $data['last_name'],
+                    'rank'              => $params['rank'],
+                    'department_id'     => $data['department_id'],
+                    'position_id'       => $data['position_id'],
+                    'employment_status' => $data['employment_status'],
+                ],
+            ]);
+        }
+
+        return $result;
     }
 
-    public function deactivate(int $id): bool {
+    public function deactivate(int $id): bool
+    {
         $sql = "
                 UPDATE employees
                 SET employment_status = 'Inactive', updated_at = NOW()
                 WHERE id = :id
                 ";
         $stmt = $this->pdo->prepare($sql);
-        return $stmt->execute(['id' => $id]);
+        $result = $stmt->execute(['id' => $id]);
+        if ($result) {
+            AuditLogger::log('employee.deactivate', 'employee', $id);
+        }
+        return $result;
     }
 
-    public function activate(int $id): bool {
+    public function activate(int $id): bool
+    {
         $sql = "
                 UPDATE employees
                 SET employment_status = 'Active', updated_at = NOW()
                 WHERE id = :id
                 ";
         $stmt = $this->pdo->prepare($sql);
-        return $stmt->execute(['id' => $id]);
+        $result = $stmt->execute(['id' => $id]);
+        if ($result) {
+            AuditLogger::log('employee.activate', 'employee', $id);
+        }
+        return $result;
     }
 
-    public function generateEmployeeId(): string {
+    public function generateEmployeeId(): string
+    {
         $sql = "
             SELECT employee_id
             FROM employees

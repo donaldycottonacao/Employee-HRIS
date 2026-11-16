@@ -1,0 +1,125 @@
+legend 
+# = already added in jira
+## = done checking and make ppt
+
+
+1.GitHub #          ipa kita ra natu ang github natu
+2.jira #            ipa kita ra natu ang jira   natu
+3.Prometheus #      ipa kita ra natu ang Prometheus natu
+4.Grafana #         ipa kita ra natu ang grafana natu
+5.CI/CD #           ipa kita ra natu ang CI/CD natu sa github 
+6.Unit test #       Open = tests/LeaveBalanceTest.php to run is .\vendor\bin\phpunit.bat tests\LeaveBalanceTest.php
+7.Terraform #       Iipa kita ang terraform
+8.Makefile #        make file natu kay DDD/TDD /Makefile, other Makefile kay selenium/Makefile
+9.SWAGGER #         ipa kita ato swagger ato swagger
+10.figma            ipa kita ato FIGMA
+11. UI test #       open selenium nya run 
+12. Rbac #          sample natu na admin naku change sa ilahang rank from employee to team leader or manager
+13. Cron job #      
+14. Web socket #    websocket sa leave request natu siya gi add
+15.docker #         docker naa na atu docker
+16. Audit trail     mao na ato admin 
+18. DDD/TDD # ##    
+19. Final - live deployment
+
+
+
+
+QA - CHECKING
+
+EMPLOYEE TEAM LEADER SIDE AND MANAGER SIDE           ---------- Dapat imo rank naka team_leader or Manager imoha para maka access ka diri kay ang rank na employee kay normal ra ------------
+
+{
+    FIX
+        employee/dashboard.php 
+        {
+
+            the weekly hours in dashboard 352.0 pero ang working time kay 8 hrs ra so 8*7 if full week man gani monday to sunday kay 56 hours ra 
+                {
+                    mao guro nang 352 gikan pero ang label niya kay weeky hours nya 352/// pero sa per week kay 56hrs raman kong 8hrs a day ang iya duty so need e fix
+                }
+
+            babaw sa log out nay small panel e click na nya e change ang employee id to EMP-### dili kay #1 / check gani ang profile lahi ra sila duha ang Employee ID, gamit ang EMP-###
+
+            Attendance summary 
+                { 
+                    e fix na siya tarunga na wa na mao 
+                }
+
+            Recent payslip
+                {
+                    ang status sa payslip e fix na siya, pending ang naka butang dapat di nana siya pending kung naa nagi na sa recent is dapat status paid nana
+                }
+        }
+
+        employee/file_leave.php or sa Leave option sa sidebar
+        {            
+            File leave
+                {
+                    ni file kog leave na personal type 3days ang avail nya 2 days ako gi file pero wa na kuha an ang 3 days na naka indicator sa babaw: e fix nya na dapat ma kuha an na siya after ma approve ang leave and buhata na sa tanan leave type and 3 ra ka leave type ug iya leave balance ang gi display
+                }
+            
+            24-Hour Request Limit Active
+                {
+                    wa koy sure kong okay ba ang 24-Hour Request Limit Active 
+                }
+
+            My Leave Application & Review Status 
+                {
+                    fix ang layout under sa DAYS kay na guba siya - para ma kita nimo need kag sample na mu file leave
+                }
+
+            Leave History// ma kita siya sa babaw
+                {
+                    ang search application kay ang Icon ug ang text niya kay nag overlap;
+
+                       --Leave record $ status history 
+                            {
+                                same gihapon awa ang DAYS column ang iya layout na guba e fix
+                            } 
+                }
+        }
+
+        employee/payslip.php
+        {
+            Pay History
+                {
+                    awa ang status sa naka pending dapat paid nana siya or unsa man ganii
+                }
+        }
+
+        employee/team_leave.php
+        {
+            Pending Leave Request
+                {
+                    ang approve niya nay error fix nya
+                }
+        }
+
+    ADD      ## enter nasad ni sa tanan 
+        employee rank, naa tay rank sa employee {employee, team leader, manager} add lang sag na mu indicate na kani siya kay team leader or manager or employee
+
+}
+
+HR SIDE 
+    {
+        FIX
+            {
+                Leave Management
+                    {
+                        sa leave balances dapat naka search na siya dili naka dropdown and either EMP-### sa employee ang e search or ilahang name para ma check ilahang balance
+                    }
+
+            }
+    }
+
+
+
+
+
+
+
+
+
+
+TESTING RANI SIYA SA CD NATU PARA ATU MA KITA JUD KONG NI GANA

@@ -1,5 +1,7 @@
 <?php
 // classes/Payroll.php
+require_once __DIR__ . '/../classes/AuditLogger.php';
+
 
 class Payroll
 {
@@ -58,13 +60,24 @@ class Payroll
             VALUES
                 (:eid, :pt, :bs, :al, :ed, 'Active')
         ");
-        return $stmt->execute([
+        $result = $stmt->execute([
             ':eid' => $employeeId,
             ':pt'  => $payType,
             ':bs'  => $basicSalary,
             ':al'  => $allowance,
             ':ed'  => $effectiveDate,
         ]);
+
+        if ($result) {
+            AuditLogger::log('salary.set', 'employee', $employeeId, [
+                'pay_type'       => $payType,
+                'basic_salary'   => $basicSalary,
+                'allowance'      => $allowance,
+                'effective_date' => $effectiveDate,
+            ]);
+        }
+
+        return $result;
     }
 
     public function getAllSalaries(): array
@@ -130,15 +143,249 @@ class Payroll
         return $row ?: null;
     }
 
-    public function updatePeriodStatus(int $id, string $status): bool
-    {
-        $allowed = ['Draft', 'Processed', 'Paid', 'Cancelled'];
-        if (!in_array($status, $allowed, true)) return false;
-        $stmt = $this->pdo->prepare("
-            UPDATE payroll_periods SET status = :s WHERE id = :id
-        ");
-        return $stmt->execute([':s' => $status, ':id' => $id]);
+    public function updatePeriodStatus(
+    int $periodId,
+    string $newStatus
+): bool {
+    $allowedStatuses = [
+        'Processed',
+        'Paid',
+        'Cancelled',
+    ];
+
+    if (!in_array($newStatus, $allowedStatuses, true)) {
+        return false;
     }
+
+    try {
+        $this->pdo->beginTransaction();
+
+        $periodStatement = $this->pdo->prepare(
+            'SELECT status
+             FROM payroll_periods
+             WHERE id = :period_id
+             LIMIT 1
+             FOR UPDATE'
+        );
+
+        $periodStatement->execute([
+            ':period_id' => $periodId,
+        ]);
+
+        $currentStatus = $periodStatement->fetchColumn();
+
+        if ($currentStatus === false) {
+            throw new RuntimeException(
+                'Payroll period was not found.'
+            );
+        }
+
+        /*
+         * Only these transitions are allowed:
+         *
+         * Draft     → Processed
+         * Processed → Paid
+         */
+        if ($currentStatus === 'Draft') {
+            if ($newStatus !== 'Processed') {
+                throw new RuntimeException(
+                    'A Draft period can only be marked Processed.'
+                );
+            }
+        } elseif ($currentStatus === 'Processed') {
+            if ($newStatus !== 'Paid') {
+                throw new RuntimeException(
+                    'A Processed period can only be marked Paid.'
+                );
+            }
+        } elseif ($currentStatus === 'Paid') {
+            throw new RuntimeException(
+                'A Paid payroll period cannot be changed.'
+            );
+        } elseif ($currentStatus === 'Cancelled') {
+            throw new RuntimeException(
+                'A Cancelled payroll period cannot be changed.'
+            );
+        } else {
+            throw new RuntimeException(
+                'Invalid payroll period status.'
+            );
+        }
+
+        /*
+         * Cancellation is allowed only before processing.
+         */
+        if ($newStatus === 'Cancelled') {
+            if ($currentStatus !== 'Draft') {
+                throw new RuntimeException(
+                    'Only Draft periods can be cancelled.'
+                );
+            }
+
+            $cancelStatement = $this->pdo->prepare(
+                "UPDATE payroll_periods
+                 SET status = 'Cancelled'
+                 WHERE id = :period_id
+                   AND status = 'Draft'"
+            );
+
+            $cancelStatement->execute([
+                ':period_id' => $periodId,
+            ]);
+
+            $this->pdo->commit();
+
+            return true;
+        }
+
+        /*
+         * A period cannot be processed or paid without payslips.
+         */
+        $summaryStatement = $this->pdo->prepare(
+            "SELECT
+                COUNT(*) AS total_payslips,
+                SUM(
+                    CASE
+                        WHEN status = 'Draft'
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS draft_payslips,
+                SUM(
+                    CASE
+                        WHEN status = 'Finalized'
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS finalized_payslips,
+                SUM(
+                    CASE
+                        WHEN status = 'Paid'
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS paid_payslips
+             FROM payslips
+             WHERE payroll_period_id = :period_id"
+        );
+
+        $summaryStatement->execute([
+            ':period_id' => $periodId,
+        ]);
+
+        $summary = $summaryStatement->fetch(
+            PDO::FETCH_ASSOC
+        );
+
+        $totalPayslips = (int)(
+            $summary['total_payslips'] ?? 0
+        );
+
+        $draftPayslips = (int)(
+            $summary['draft_payslips'] ?? 0
+        );
+
+        $finalizedPayslips = (int)(
+            $summary['finalized_payslips'] ?? 0
+        );
+
+        $paidPayslips = (int)(
+            $summary['paid_payslips'] ?? 0
+        );
+
+        if ($totalPayslips === 0) {
+            throw new \RuntimeException(
+                'You must generate payslips before marking '
+                . 'this payroll period as Processed.'
+            );
+        }
+
+        /*
+         * Draft → Processed:
+         * Every payslip must be finalized first.
+         */
+        if ($currentStatus === 'Draft') {
+            if ($draftPayslips > 0) {
+                throw new \RuntimeException(
+                    'You must finalize all payslips before '
+                    . 'marking this period as Processed.'
+                );
+            }
+
+            if ($finalizedPayslips !== $totalPayslips) {
+                throw new \RuntimeException(
+                    'Every payslip must be finalized before '
+                    . 'marking this period as Processed.'
+                );
+            }
+        }
+
+        /*
+         * Processed → Paid:
+         * Every payslip must still be Finalized.
+         * They will all be marked Paid automatically below.
+         */
+        if ($currentStatus === 'Processed') {
+            if ($draftPayslips > 0) {
+                throw new \RuntimeException(
+                    'You must finalize all payslips before '
+                    . 'marking this period as Paid.'
+                );
+            }
+
+            if ($finalizedPayslips !== $totalPayslips) {
+                throw new \RuntimeException(
+                    'Every payslip must be finalized before '
+                    . 'marking this period as Paid.'
+                );
+            }
+        }
+
+        /*
+         * Mark the payroll period.
+         */
+        $periodUpdate = $this->pdo->prepare(
+            'UPDATE payroll_periods
+             SET status = :new_status
+             WHERE id = :period_id
+               AND status = :current_status'
+        );
+
+        $periodUpdate->execute([
+            ':new_status' => $newStatus,
+            ':period_id' => $periodId,
+            ':current_status' => $currentStatus,
+        ]);
+
+        /*
+         * When the period becomes Paid, automatically mark
+         * every Finalized payslip as Paid.
+         */
+        if ($newStatus === 'Paid') {
+            $payslipUpdate = $this->pdo->prepare(
+                "UPDATE payslips
+                 SET status = 'Paid'
+                 WHERE payroll_period_id = :period_id
+                   AND status = 'Finalized'"
+            );
+
+            $payslipUpdate->execute([
+                ':period_id' => $periodId,
+            ]);
+        }
+
+        $this->pdo->commit();
+
+        return true;
+    } catch (\Throwable $exception) {
+        if ($this->pdo->inTransaction()) {
+            $this->pdo->rollBack();
+        }
+
+        throw $exception;
+    }
+}
+
 
     // ─── Attendance Summary ──────────────────────────────────────────────────
 
@@ -224,121 +471,130 @@ class Payroll
 
     // ─── Payslip Generation ──────────────────────────────────────────────────
 
-    public function generatePayslip(int $periodId, int $employeeId): array {
-    $period = $this->getPeriodById($periodId);
-    $salary = $this->getActiveSalary($employeeId);
-    $rates  = $this->getDeductionRates();
-    $attend = $this->getAttendanceSummary(
-        $employeeId,
-        $period['start_date'],
-        $period['end_date']
-    );
-
-    if (!$salary) {
-        return ['error' => 'No active salary found for this employee.'];
-    }
-
-    $basicSalary  = (float)$salary['basic_salary'];
-    $allowance    = (float)$salary['allowance'];
-    $payType      = $salary['pay_type'];
-    $workingDays  = $attend['working_days'];
-    $daysWorked   = $attend['days_worked'];
-    $absentDays   = $attend['absent_days'];
-    $lateMinutes  = $attend['late_minutes'];
-    $otHours      = $attend['ot_hours'];
-    $otMultiplier = 1.25;
-
-    // ── Daily rate — semi-monthly aware ──────────────────────────────────
-    if ($payType === 'Monthly') {
-        // Split salary in half for this cut-off
-        // then divide by actual working days in the period
-        $periodWorkingDays = max(1, $this->countWorkingDays(
+    public function generatePayslip(int $periodId, int $employeeId): array
+    {
+        $period = $this->getPeriodById($periodId);
+        $salary = $this->getActiveSalary($employeeId);
+        $rates  = $this->getDeductionRates();
+        $attend = $this->getAttendanceSummary(
+            $employeeId,
             $period['start_date'],
             $period['end_date']
-        ));
-        $halfMonthSalary = $basicSalary / 2;
-        $dailyRate       = $halfMonthSalary / $periodWorkingDays;
-    } else {
-        // Daily or Hourly — use as-is
-        $dailyRate = $basicSalary;
-    }
+        );
 
-    $hourlyRate = $dailyRate / self::STANDARD_HOURS;
+        if (!$salary) {
+            return ['error' => 'No active salary found for this employee.'];
+        }
 
-    // ── Earnings ─────────────────────────────────────────────────────────
-    $basicPay    = round($dailyRate * $daysWorked, 2);
-    $overtimePay = round($hourlyRate * $otMultiplier * $otHours, 2);
+        $basicSalary  = (float)$salary['basic_salary'];
+        $allowance    = (float)$salary['allowance'];
+        $payType      = $salary['pay_type'];
+        $workingDays  = $attend['working_days'];
+        $daysWorked   = $attend['days_worked'];
+        $absentDays   = $attend['absent_days'];
+        $lateMinutes  = $attend['late_minutes'];
+        $otHours      = $attend['ot_hours'];
+        $otMultiplier = 1.25;
 
-    // ── Absence and Late deductions ──────────────────────────────────────
-    $absencesDeduction = round($dailyRate * $absentDays, 2);
-    $lateDays          = $this->binarySearchLateDeductionDays($lateMinutes);
-    $lateDeduction     = round($dailyRate * $lateDays, 2);
-
-    // ── Allowance also split in half for semi-monthly ────────────────────
-    $periodAllowance = $payType === 'Monthly'
-        ? round($allowance / 2, 2)
-        : $allowance;
-
-    // ── Gross ────────────────────────────────────────────────────────────
-    $grossPay = round($basicPay + $periodAllowance + $overtimePay, 2);
-
-    // ── Government deductions from DB ─────────────────────────────────────
-    // For Monthly employees: deductions are also split per cut-off
-    $sss = $philhealth = $pagibig = $withholdingTax = 0.0;
-    foreach ($rates as $r) {
-        $base = strtolower($r['applies_to']) === 'gross' ? $grossPay : $basicSalary;
-        $amt  = $r['type'] === 'Percentage'
-            ? round($base * ((float)$r['rate'] / 100), 2)
-            : round((float)$r['rate'], 2);
-
-        // Split in half for semi-monthly
+        // ── Daily rate — semi-monthly aware ──────────────────────────────────
         if ($payType === 'Monthly') {
-            $amt = round($amt / 2, 2);
+            // Split salary in half for this cut-off
+            // then divide by actual working days in the period
+            $periodWorkingDays = max(1, $this->countWorkingDays(
+                $period['start_date'],
+                $period['end_date']
+            ));
+            $halfMonthSalary = $basicSalary / 2;
+            $dailyRate       = $halfMonthSalary / $periodWorkingDays;
+        } else {
+            // Daily or Hourly — use as-is
+            $dailyRate = $basicSalary;
         }
 
-        switch (strtolower($r['name'])) {
-            case 'sss':             $sss            = $amt; break;
-            case 'philhealth':      $philhealth     = $amt; break;
-            case 'pag-ibig':        $pagibig        = $amt; break;
-            case 'withholding tax': $withholdingTax = $amt; break;
+        $hourlyRate = $dailyRate / self::STANDARD_HOURS;
+
+        // ── Earnings ─────────────────────────────────────────────────────────
+        $basicPay    = round($dailyRate * $daysWorked, 2);
+        $overtimePay = round($hourlyRate * $otMultiplier * $otHours, 2);
+
+        // ── Absence and Late deductions ──────────────────────────────────────
+        $absencesDeduction = round($dailyRate * $absentDays, 2);
+        $lateDays          = $this->binarySearchLateDeductionDays($lateMinutes);
+        $lateDeduction     = round($dailyRate * $lateDays, 2);
+
+        // ── Allowance also split in half for semi-monthly ────────────────────
+        $periodAllowance = $payType === 'Monthly'
+            ? round($allowance / 2, 2)
+            : $allowance;
+
+        // ── Gross ────────────────────────────────────────────────────────────
+        $grossPay = round($basicPay + $periodAllowance + $overtimePay, 2);
+
+        // ── Government deductions from DB ─────────────────────────────────────
+        // For Monthly employees: deductions are also split per cut-off
+        $sss = $philhealth = $pagibig = $withholdingTax = 0.0;
+        foreach ($rates as $r) {
+            $base = strtolower($r['applies_to']) === 'gross' ? $grossPay : $basicSalary;
+            $amt  = $r['type'] === 'Percentage'
+                ? round($base * ((float)$r['rate'] / 100), 2)
+                : round((float)$r['rate'], 2);
+
+            // Split in half for semi-monthly
+            if ($payType === 'Monthly') {
+                $amt = round($amt / 2, 2);
+            }
+
+            switch (strtolower($r['name'])) {
+                case 'sss':
+                    $sss            = $amt;
+                    break;
+                case 'philhealth':
+                    $philhealth     = $amt;
+                    break;
+                case 'pag-ibig':
+                    $pagibig        = $amt;
+                    break;
+                case 'withholding tax':
+                    $withholdingTax = $amt;
+                    break;
+            }
         }
+
+        $totalDeductions = round(
+            $sss + $philhealth + $pagibig + $withholdingTax
+                + $absencesDeduction + $lateDeduction,
+            2
+        );
+        $netPay = round($grossPay - $totalDeductions, 2);
+
+        return [
+            'payroll_period_id'  => $periodId,
+            'employee_id'        => $employeeId,
+            'pay_type'           => $payType,
+            'basic_salary'       => $basicSalary,
+            'working_days'       => $workingDays,
+            'days_worked'        => $daysWorked,
+            'absent_days'        => $absentDays,
+            'late_minutes'       => $lateMinutes,
+            'ot_hours'           => $otHours,
+            'ot_rate_multiplier' => $otMultiplier,
+            'basic_pay'          => $basicPay,
+            'allowance'          => $periodAllowance,
+            'overtime_pay'       => $overtimePay,
+            'other_earnings'     => 0.00,
+            'gross_pay'          => $grossPay,
+            'sss'                => $sss,
+            'philhealth'         => $philhealth,
+            'pagibig'            => $pagibig,
+            'withholding_tax'    => $withholdingTax,
+            'absences_deduction' => $absencesDeduction,
+            'late_deduction'     => $lateDeduction,
+            'other_deductions'   => 0.00,
+            'total_deductions'   => $totalDeductions,
+            'net_pay'            => $netPay,
+            'status'             => 'Draft',
+        ];
     }
-
-    $totalDeductions = round(
-        $sss + $philhealth + $pagibig + $withholdingTax
-        + $absencesDeduction + $lateDeduction,
-        2
-    );
-    $netPay = round($grossPay - $totalDeductions, 2);
-
-    return [
-        'payroll_period_id'  => $periodId,
-        'employee_id'        => $employeeId,
-        'pay_type'           => $payType,
-        'basic_salary'       => $basicSalary,
-        'working_days'       => $workingDays,
-        'days_worked'        => $daysWorked,
-        'absent_days'        => $absentDays,
-        'late_minutes'       => $lateMinutes,
-        'ot_hours'           => $otHours,
-        'ot_rate_multiplier' => $otMultiplier,
-        'basic_pay'          => $basicPay,
-        'allowance'          => $periodAllowance,
-        'overtime_pay'       => $overtimePay,
-        'other_earnings'     => 0.00,
-        'gross_pay'          => $grossPay,
-        'sss'                => $sss,
-        'philhealth'         => $philhealth,
-        'pagibig'            => $pagibig,
-        'withholding_tax'    => $withholdingTax,
-        'absences_deduction' => $absencesDeduction,
-        'late_deduction'     => $lateDeduction,
-        'other_deductions'   => 0.00,
-        'total_deductions'   => $totalDeductions,
-        'net_pay'            => $netPay,
-        'status'             => 'Draft',
-    ];
-}
 
     public function savePayslip(array $data): bool
     {
@@ -385,7 +641,20 @@ class Payroll
                 net_pay             = VALUES(net_pay),
                 status              = VALUES(status)
         ";
-        return $this->pdo->prepare($sql)->execute($data);
+        $stmt = $this->pdo->prepare($sql);
+        $result = $stmt->execute($data);
+
+        if ($result) {
+            $payslipId = (int)$this->pdo->lastInsertId();
+            AuditLogger::log('payslip.generate', 'payslip', $payslipId, [
+                'employee_id'       => $data['employee_id'],
+                'payroll_period_id' => $data['payroll_period_id'],
+                'net_pay'           => $data['net_pay'],
+                'status'            => $data['status'],
+            ]);
+        }
+
+        return $result;
     }
 
     public function getPayslipsByPeriod(int $periodId): array
@@ -462,7 +731,15 @@ class Payroll
         $stmt = $this->pdo->prepare("
             UPDATE payslips SET status = :s WHERE id = :id
         ");
-        return $stmt->execute([':s' => $status, ':id' => $id]);
+        $result = $stmt->execute([':s' => $status, ':id' => $id]);
+
+        if ($result) {
+            AuditLogger::log('payslip.status_change', 'payslip', $id, [
+                'new_status' => $status,
+            ]);
+        }
+
+        return $result;
     }
 
     // ─── Helpers ─────────────────────────────────────────────────────────────
